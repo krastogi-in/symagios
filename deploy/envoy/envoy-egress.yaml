@@ -1,0 +1,218 @@
+# Admin is loopback-only inside the container and is NOT published to the host.
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9902
+
+static_resources:
+  listeners:
+    - name: symagios_egress
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10001
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              # Mesh callers must present a Vault-PKI workload cert. Source identity
+              # is derived from that cert (not from X-Symagios-Source).
+              require_client_certificate: true
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /certs/envoy-egress/tls.crt
+                    private_key:
+                      filename: /certs/envoy-egress/tls.key
+                validation_context:
+                  trusted_ca:
+                    filename: /certs/ca.crt
+                alpn_protocols: ["h2", "http/1.1"]
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: symagios_egress
+                codec_type: AUTO
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "[egress] %START_TIME% %REQ(:METHOD)% %REQ(:AUTHORITY)% %REQ(:PATH)% src=%REQ(x-symagios-source)% code=%RESPONSE_CODE% flags=%RESPONSE_FLAGS% %DURATION%ms\n"
+                http2_protocol_options:
+                  allow_connect: true
+                upgrade_configs:
+                  - upgrade_type: CONNECT
+                route_config:
+                  name: egress_routes
+                  virtual_hosts:
+                    - name: egress
+                      domains: ["*"]
+                      routes:
+                        # HTTPS destinations: client sends CONNECT, TLS runs inside the tunnel.
+                        - match:
+                            connect_matcher: {}
+                          route:
+                            cluster: dynamic_forward_proxy_cluster
+                            upgrade_configs:
+                              - upgrade_type: CONNECT
+                                connect_config: {}
+                        # Plain HTTP forward-proxy (Host/:authority is the destination).
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: dynamic_forward_proxy_cluster
+                            timeout: 30s
+                http_filters:
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      inline_code: |
+                        -- Map workload cert DNS SAN / CN → OPA source identity.
+                        local function map_workload(name)
+                          if name == nil or name == "" then
+                            return nil
+                          end
+                          name = string.lower(name)
+                          name = string.gsub(name, "%.symagios%.local$", "")
+                          if name == "engine" or name == "search-broker" then
+                            return "symagios-engine"
+                          end
+                          if name == "mcp-gateway" then
+                            return "mcp-gateway"
+                          end
+                          if name == "agent-gateway" then
+                            return "agent-gateway"
+                          end
+                          return nil
+                        end
+
+                        local function source_from_peer(request_handle)
+                          local ssl = request_handle:streamInfo():downstreamSslConnection()
+                          if ssl == nil then
+                            return nil
+                          end
+                          local dns = ssl:dnsSansPeerCertificate()
+                          if dns ~= nil then
+                            for _, san in ipairs(dns) do
+                              local mapped = map_workload(san)
+                              if mapped ~= nil then
+                                return mapped
+                              end
+                            end
+                          end
+                          local subject = ssl:subjectPeerCertificate()
+                          if subject ~= nil then
+                            local cn = string.match(subject, "CN=([^,/]+)")
+                            return map_workload(cn)
+                          end
+                          return nil
+                        end
+
+                        function envoy_on_request(request_handle)
+                          request_handle:headers():add("x-symagios-traffic", "egress")
+                          -- Guarantee destination reaches OPA (CONNECT uses :authority, not Host).
+                          local authority = request_handle:headers():get(":authority")
+                          if authority ~= nil and authority ~= "" then
+                            request_handle:headers():replace("x-egress-authority", authority)
+                          end
+                          -- Never trust client-supplied source; derive from mTLS peer cert.
+                          request_handle:headers():remove("x-symagios-source")
+                          local source = source_from_peer(request_handle)
+                          if source ~= nil then
+                            request_handle:headers():add("x-symagios-source", source)
+                          end
+                        end
+                  # Hard allowlist BEFORE OPA — defense in depth (see deploy/docs/egress-allowlist.md).
+                  - name: envoy.filters.http.rbac
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                      rules:
+                        action: ALLOW
+                        policies:
+                          "allowed-egress-hosts":
+                            permissions:
+                              - header:
+                                  name: ":authority"
+                                  string_match:
+                                    safe_regex:
+                                      google_re2:
+                                        max_program_size: 200
+                                      regex: "^(api\\.tavily\\.com|api\\.anthropic\\.com|api\\.openai\\.com|([a-z0-9-]+-)?aiplatform(\\.[a-z]+)?(\\.rep)?\\.googleapis\\.com|localhost|127\\.0\\.0\\.1|agent-gateway|envoy-ingress|envoy-egress|[a-z0-9-]+(\\.[a-z0-9-]+)*\\.symagios\\.local)(:[0-9]+)?$"
+                            principals:
+                              - any: true
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: opa_ext_authz
+                        timeout: 0.5s
+                      failure_mode_allow: false
+                  - name: envoy.filters.http.dynamic_forward_proxy
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+                      dns_cache_config:
+                        name: dynamic_forward_proxy_cache
+                        dns_lookup_family: V4_ONLY
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: dynamic_forward_proxy_cluster
+      lb_policy: CLUSTER_PROVIDED
+      cluster_type:
+        name: envoy.clusters.dynamic_forward_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+          # Envoy ≥1.32 requires auto_sni+auto_san_validation OR this flag.
+          # We do NOT use auto_san_validation: egress identity is mesh client-cert
+          # (Lua → x-symagios-source) + RBAC/OPA host allowlist — same idea as meshauth.
+          # CONNECT tunnels also carry end-to-end TLS inside the tunnel; Envoy must
+          # not rewrite/validate upstream SANs for those hops.
+          allow_insecure_cluster_options: true
+          dns_cache_config:
+            name: dynamic_forward_proxy_cache
+            dns_lookup_family: V4_ONLY
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http_protocol_options: {}
+
+    - name: opa_ext_authz
+      type: STRICT_DNS
+      connect_timeout: 5s
+      # POC tradeoff: OPA gRPC is plaintext on the compose network (same as ingress).
+      health_checks:
+        - timeout: 2s
+          interval: 10s
+          unhealthy_threshold: 3
+          healthy_threshold: 1
+          tcp_health_check: {}
+          always_log_health_check_failures: true
+      outlier_detection:
+        consecutive_5xx: 3
+        interval: 10s
+        base_ejection_time: 30s
+        max_ejection_percent: 100
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: opa_ext_authz
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: opa
+                      port_value: 9191

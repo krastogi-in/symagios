@@ -1,0 +1,74 @@
+{
+  "servers": [
+    {
+      "id": "demo",
+      "enabled": true,
+      "transport": "stub",
+      "base_url": "stub://demo",
+      "description": "Local stub MCP — no network, no Vault",
+      "allowed_sources": ["symagios-engine", ""],
+      "tools": [
+        {
+          "name": "echo",
+          "description": "Echo arguments back (stub)",
+          "egress": false
+        },
+        {
+          "name": "lookup_docs",
+          "description": "Stub docs lookup",
+          "egress": false
+        }
+      ]
+    },
+    {
+      "id": "http-example",
+      "enabled": false,
+      "transport": "http",
+      "base_url": "http://127.0.0.1:3100",
+      "vault_path": "symagios/mcp/http-example",
+      "vault_field": "token",
+      "description": "Enable and point at a streamable-HTTP MCP server",
+      "tools": [
+        { "name": "example_tool", "description": "Replace with real tool names from the server" }
+      ]
+    },
+    {
+      "id": "sse-example",
+      "enabled": false,
+      "transport": "sse",
+      "base_url": "http://127.0.0.1:3101",
+      "messages_url": "http://127.0.0.1:3101/message",
+      "description": "SSE MCP: GET events + POST messages",
+      "tools": [
+        { "name": "sse_tool", "description": "Replace with real tool names" }
+      ]
+    },
+    {
+      "id": "stdio-example",
+      "enabled": false,
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/symagios-workspace"],
+      "description": "Local stdio MCP process (run under Landlock/seccomp when invoked from engine)",
+      "tools": [
+        { "name": "list_directory", "description": "filesystem server tool" }
+      ]
+    },
+    {
+      "id": "mailer",
+      "enabled": true,
+      "transport": "stub",
+      "base_url": "stub://mailer",
+      "vault_path": "symagios/mcp/mailer",
+      "vault_field": "token",
+      "description": "Egress-marked tool — content-guarded; use real http/sse + Vault for production",
+      "tools": [
+        {
+          "name": "send_email",
+          "description": "Send email (egress; content-guarded)",
+          "egress": true
+        }
+      ]
+    }
+  ]
+}

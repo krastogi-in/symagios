@@ -1,0 +1,9 @@
+{
+  "demo": "content-guard-hitl",
+  "note": "Synthetic PII for Symagios block-mode guard → HITL only. Not real.",
+  "subject": "Jane Q. Public",
+  "ssn": "123-45-6789",
+  "email": "jane.public@example.com",
+  "phone": "+1-202-555-0147",
+  "card": "4111111111111111"
+}

@@ -1,0 +1,421 @@
+services:
+  vault:
+    image: hashicorp/vault:1.17
+    command: server -dev -dev-root-token-id=${VAULT_DEV_ROOT_TOKEN_ID:?set_in_.env} -dev-listen-address=127.0.0.1:8200
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN_ID:?set_in_.env}
+      VAULT_ADDR: http://127.0.0.1:8200
+    volumes:
+      - ./deploy/vault/policies:/vault/policies:ro,z
+    # Plaintext API is loopback-only inside this container. Not published.
+    networks:
+      default:
+        aliases:
+          - vault.symagios.local
+    cap_add:
+      - IPC_LOCK
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8200/v1/sys/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+    profiles:
+      - auth
+
+  # Shares Vault's network. Other containers use https://vault:8202 with a client cert.
+  vault-mtls:
+    image: envoyproxy/envoy:v1.32-latest
+    network_mode: service:vault
+    # Bypass entrypoint chown of /dev/std* (fails under rootless Podman/SELinux).
+    entrypoint: ["/usr/local/bin/envoy"]
+    command: ["-c", "/etc/envoy/vault-mtls.yaml", "--log-level", "info"]
+    volumes:
+      - ./deploy/envoy/vault-mtls.yaml:/etc/envoy/vault-mtls.yaml:ro,z
+      - ./deploy/certs/vault:/certs/vault:ro,z
+      - ./deploy/certs/ca.crt:/certs/ca.crt:ro,z
+    depends_on:
+      vault:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - auth
+
+  keycloak-vault-fetch:
+    image: hashicorp/vault:1.17
+    environment:
+      VAULT_ADDR: https://vault.symagios.local:8202
+      VAULT_TOKEN: ${VAULT_TOKEN_KEYCLOAK:?run_make_vault-install}
+      VAULT_CACERT: /certs/ca.crt
+      VAULT_CLIENT_CERT: /certs/keycloak/tls.crt
+      VAULT_CLIENT_KEY: /certs/keycloak/tls.key
+    volumes:
+      - ./deploy/certs/keycloak:/certs/keycloak:ro,z
+      - ./deploy/certs/ca.crt:/certs/ca.crt:ro,z
+      - ./scripts/keycloak-vault-fetch.sh:/opt/symagios/keycloak-vault-fetch.sh:ro,z
+      - keycloak-vault-secrets:/out
+    depends_on:
+      vault:
+        condition: service_healthy
+      vault-mtls:
+        condition: service_started
+    entrypoint: ["/bin/sh", "/opt/symagios/keycloak-vault-fetch.sh"]
+    restart: "no"
+    profiles:
+      - auth
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    entrypoint: ["/bin/bash", "/opt/symagios/keycloak-vault-entrypoint.sh"]
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:?set_in_.env}
+      KC_HOSTNAME: https://localhost:8443
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
+      KC_HEALTH_ENABLED: "true"
+      # HTTP :8080 is NOT published. It exists only for kcadm inside this container.
+      # symagios-cli gets tokens via Envoy HTTPS, which proxies here over mTLS.
+      KC_HTTPS_PORT: "8443"
+      KC_HTTPS_CERTIFICATE_FILE: /certs/keycloak/tls.crt
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /certs/keycloak/tls.key
+      KC_HTTPS_CLIENT_AUTH: required
+      KC_HTTPS_TRUST_STORE_FILE: /certs/ca.p12
+      KC_HTTPS_TRUST_STORE_PASSWORD: changeit
+      KC_HTTPS_TRUST_STORE_TYPE: PKCS12
+    volumes:
+      - ./deploy/keycloak:/opt/keycloak/data/import:ro,z
+      - ./scripts/keycloak-vault-entrypoint.sh:/opt/symagios/keycloak-vault-entrypoint.sh:ro,z
+      - ./deploy/certs/keycloak:/certs/keycloak:ro,z
+      - ./deploy/certs/ca.p12:/certs/ca.p12:ro,z
+      - keycloak-data:/opt/keycloak/data
+      - keycloak-vault-secrets:/run/secrets/vault:ro
+    depends_on:
+      vault:
+        condition: service_healthy
+      keycloak-vault-fetch:
+        condition: service_completed_successfully
+    # No host port for 8080. Plaintext Keycloak is not reachable from the laptop.
+    # Keycloak 26 serves /health/* on the management port (:9000, HTTPS), not :8080.
+    # Use a stable HTTP path on the app listener for compose readiness.
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080; echo -e 'GET /realms/master HTTP/1.1\\r\\nhost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; grep -q '200 OK' <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+    profiles:
+      - auth
+
+  opa:
+    image: openpolicyagent/opa:0.70.0-envoy
+    command:
+      - "run"
+      - "--server"
+      # Decision/REST API is loopback-only — mesh peers cannot rewrite policies.
+      # Envoy ext_authz still reaches gRPC :9191 on the compose network.
+      - "--addr=127.0.0.1:8181"
+      - "--set=plugins.envoy_ext_authz_grpc.addr=:9191"
+      - "--set=plugins.envoy_ext_authz_grpc.query=data.envoy.authz.allow"
+      - "--set=decision_logs.console=true"
+      - "/policies"
+    volumes:
+      - ./deploy/opa/policies:/policies:ro,z
+    # Image is distroless (no wget/curl/shell); binary lives at /opa.
+    healthcheck:
+      test: ["CMD", "/opa", "version"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+    profiles:
+      - auth
+
+  envoy-ingress:
+    image: envoyproxy/envoy:v1.32-latest
+    entrypoint: ["/usr/local/bin/envoy"]
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+    volumes:
+      - ./deploy/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro,z
+      - ./deploy/certs/envoy-ingress:/certs/envoy-ingress:ro,z
+      - ./deploy/certs/ca.crt:/certs/ca.crt:ro,z
+    ports:
+      # TLS terminated at Envoy. No plaintext listener.
+      - "8443:10000"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      opa:
+        condition: service_healthy
+    # Distroless-ish image + custom entrypoint: no bash /dev/tcp for CMD-SHELL.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/envoy", "--version"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+    profiles:
+      - auth
+
+  envoy-egress:
+    image: envoyproxy/envoy:v1.32-latest
+    entrypoint: ["/usr/local/bin/envoy"]
+    command: ["-c", "/etc/envoy/envoy-egress.yaml", "--log-level", "info"]
+    volumes:
+      - ./deploy/envoy/envoy-egress.yaml:/etc/envoy/envoy-egress.yaml:ro,z
+      - ./deploy/certs/envoy-egress:/certs/envoy-egress:ro,z
+      - ./deploy/certs/ca.crt:/certs/ca.crt:ro,z
+    # Not published to the host — mesh-only. Callers must present a workload client cert.
+    depends_on:
+      opa:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/envoy", "--version"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+    profiles:
+      - auth
+
+  # TUS agent entry (creates action_run). Not A2A — that is agent-gateway.
+  agent-entry:
+    build: .
+    command: ["agent-entry"]
+    environment:
+      SYMAGIOS_DB_PATH: /data/symagios.db
+      SYMAGIOS_AGENT_ENTRY_LISTEN: ":8443"
+      SYMAGIOS_AGENT_ENTRY_TLS_CERT: /certs/agent-entry/tls.crt
+      SYMAGIOS_AGENT_ENTRY_TLS_KEY: /certs/agent-entry/tls.key
+      SYMAGIOS_AGENT_ENTRY_TLS_CA: /certs/ca.crt
+      SYMAGIOS_LOG_LEVEL: info
+      VAULT_ADDR: https://vault.symagios.local:8202
+      VAULT_TOKEN: ${VAULT_TOKEN_AGENT_ENTRY:?run_make_vault-install}
+      VAULT_CACERT: /certs/ca.crt
+      VAULT_CLIENT_CERT: /certs/agent-entry/tls.crt
+      VAULT_CLIENT_KEY: /certs/agent-entry/tls.key
+      SYMAGIOS_VAULT_ENGINE_PATH: symagios/engine
+    volumes:
+      - symagios-data:/data
+      - ./deploy/certs/agent-entry:/certs/agent-entry:ro,z
+      - ./deploy/certs/ca.crt:/certs/ca.crt:ro,z
+    depends_on:
+      vault:
+        condition: service_healthy
+      vault-mtls:
+        condition: service_started
+    restart: unless-stopped
+    profiles:
+      - auth
+
+  # A2A HTTP surface (agent card, message/send, tasks). Same image as engine.
+  agent-gateway:
+    build: .
+    command: ["agent-gateway"]
+    environment:
+      SYMAGIOS_DB_PATH: /data/symagios.db
+      SYMAGIOS_AGENT_GATEWAY_LISTEN: ":8443"
+      SYMAGIOS_AGENT_GATEWAY_NAME: symagios
+      # Comma-separated peer A2A bases (seeded at start). Example:
+      # SYMAGIOS_AGENT_GATEWAY_EXTERNAL_HOSTS: "https://peer-a:8080,https://peer-b:8080"
+      SYMAGIOS_AGENT_GATEWAY_EXTERNAL_HOSTS: ""
+      SYMAGIOS_AGENT_GATEWAY_TLS_CERT: /certs/agent-gateway/tls.crt
+      SYMAGIOS_AGENT_GATEWAY_TLS_KEY: /certs/agent-gateway/tls.key
+      SYMAGIOS_AGENT_GATEWAY_TLS_CA: /certs/ca.crt
+      SYMAGIOS_EGRESS_PROXY: https://envoy-egress:10001
+      SYMAGIOS_LOG_LEVEL: info
+      VAULT_ADDR: https://vault.symagios.local:8202
+      VAULT_TOKEN: ${VAULT_TOKEN_AGENT_GATEWAY:?run_make_vault-install}
+      VAULT_CACERT: /certs/ca.crt
+      VAULT_CLIENT_CERT: /certs/agent-gateway/tls.crt
+      VAULT_CLIENT_KEY: /certs/agent-gateway/tls.key
+      SYMAGIOS_VAULT_ENGINE_PATH: symagios/engine
+    volumes:
+      - symagios-data:/data
+      - ./deploy/certs/agent-gateway:/certs/agent-gateway:ro,z
+      - ./deploy/certs/ca.crt:/certs/ca.crt:ro,z
+    depends_on:
+      vault:
+        condition: service_healthy
+      vault-mtls:
+        condition: service_started
+      engine:
+        condition: service_started
+      envoy-egress:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - auth
+
+  engine:
+    build: .
+    command: ["engine"]
+    environment:
+      SYMAGIOS_DB_PATH: /data/symagios.db
+      SYMAGIOS_WORKERS: "4"
+      SYMAGIOS_LOG_LEVEL: info
+      SYMAGIOS_LOG_FORMAT: json
+      SYMAGIOS_MCP_GATEWAY: https://mcp-gateway:8443
+      SYMAGIOS_SEARCH_BROKER: https://search-broker:8443/v1/search
+      SYMAGIOS_EGRESS_PROXY: https://envoy-egress:10001
+      SYMAGIOS_SOURCE: symagios-engine
+      SYMAGIOS_CONFIG: /etc/symagios/config.yaml
+      # Content guards: default redact. Set SYMAGIOS_CONTENT_MODE=block to park HITL on PII/secrets.
+      SYMAGIOS_CONTENT_GUARD: ${SYMAGIOS_CONTENT_GUARD:-true}
+      SYMAGIOS_CONTENT_MODE: ${SYMAGIOS_CONTENT_MODE:-redact}
+      VAULT_ADDR: https://vault.symagios.local:8202
+      VAULT_TOKEN: ${VAULT_TOKEN_ENGINE:?run_make_vault-install}
+      VAULT_CACERT: /certs/ca.crt
+      VAULT_CLIENT_CERT: /certs/engine/tls.crt
+      VAULT_CLIENT_KEY: /certs/engine/tls.key
+      SYMAGIOS_VAULT_ENGINE_PATH: symagios/engine
+      # Claude on Vertex (provider: claude-vertex in deploy/llm/config.yaml)
+      VERTEX_PROJECT: ${VERTEX_PROJECT:-}
+      VERTEX_LOCATION: ${VERTEX_LOCATION:-}
+      # Optional one-shot bearer (~1h). Prefer ADC mount below — engine refreshes ADC.
+      VERTEX_ACCESS_TOKEN: ${VERTEX_ACCESS_TOKEN:-}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      # Inside the container; host file mounted at /gcp/adc.json
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-/gcp/adc.json}
+      SYMAGIOS_VERTEX_FORCE_TOKEN: ${SYMAGIOS_VERTEX_FORCE_TOKEN:-}
+    # Worker cgroups + eBPF LSM (rootless Podman mounts cgroup ro unless unmasked).
+    # Worker cgroups need a writable delegated cgroup + SELinux relabel disable
+    # under rootless Podman/Fedora. eBPF LSM still needs a rootful runtime
+    # (kernel.unprivileged_bpf_disabled); workers run without syscall policy then.
+    cap_add:
+      - BPF
+      - PERFMON
+      - SYS_ADMIN
+      - SYS_RESOURCE
+      - IPC_LOCK
+    security_opt:
+      - unmask=/sys/fs/cgroup
+      - label=disable
+    volumes:
+      - symagios-data:/data
+      - ./deploy/certs/engine:/certs/engine:ro,z
+      - ./deploy/certs/ca.crt:/certs/ca.crt:ro,z
+      - ./deploy/llm/config.yaml:/etc/symagios/config.yaml:ro,z
+      # gcloud ADC (gcloud auth application-default login). Override host path with VERTEX_ADC_HOST.
+      - ${VERTEX_ADC_HOST:-${HOME}/.config/gcloud/application_default_credentials.json}:/gcp/adc.json:ro,z
+    depends_on:
+      vault:
+        condition: service_healthy
+      vault-mtls:
+        condition: service_started
+      mcp-gateway:
+        condition: service_started
+      search-broker:
+        condition: service_started
+      envoy-egress:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - auth
+
+  search-broker:
+    build: .
+    entrypoint: ["/usr/local/bin/search-broker"]
+    environment:
+      SYMAGIOS_SEARCH_LISTEN: ":8443"
+      SYMAGIOS_SEARCH_TLS_CERT: /certs/search-broker/tls.crt
+      SYMAGIOS_SEARCH_TLS_KEY: /certs/search-broker/tls.key
+      SYMAGIOS_SEARCH_TLS_CA: /certs/ca.crt
+      SYMAGIOS_EGRESS_PROXY: https://envoy-egress:10001
+      SYMAGIOS_SOURCE: symagios-engine
+      VAULT_ADDR: https://vault.symagios.local:8202
+      VAULT_TOKEN: ${VAULT_TOKEN_SEARCH_BROKER:?run_make_vault-install}
+      VAULT_CACERT: /certs/ca.crt
+      VAULT_CLIENT_CERT: /certs/search-broker/tls.crt
+      VAULT_CLIENT_KEY: /certs/search-broker/tls.key
+      VAULT_TAVILY_PATH: symagios/tavily
+    volumes:
+      - ./deploy/certs/search-broker:/certs/search-broker:ro,z
+      - ./deploy/certs/ca.crt:/certs/ca.crt:ro,z
+    depends_on:
+      vault:
+        condition: service_healthy
+      vault-mtls:
+        condition: service_started
+      envoy-egress:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - auth
+
+  mcp-gateway:
+    build: .
+    entrypoint: ["/usr/local/bin/mcp-gateway"]
+    environment:
+      SYMAGIOS_MCP_LISTEN: ":8443"
+      SYMAGIOS_MCP_REGISTRY: /mcp/registry.json
+      SYMAGIOS_MCP_TLS_CERT: /certs/mcp-gateway/tls.crt
+      SYMAGIOS_MCP_TLS_KEY: /certs/mcp-gateway/tls.key
+      SYMAGIOS_MCP_TLS_CA: /certs/ca.crt
+      SYMAGIOS_CONTENT_GUARD: "true"
+      SYMAGIOS_MCP_ADMIN_TOKEN: ${SYMAGIOS_MCP_ADMIN_TOKEN:?set_in_.env}
+      SYMAGIOS_EGRESS_PROXY: https://envoy-egress:10001
+      SYMAGIOS_SOURCE: mcp-gateway
+      VAULT_ADDR: https://vault.symagios.local:8202
+      VAULT_TOKEN: ${VAULT_TOKEN_MCP_GATEWAY:?run_make_vault-install}
+      VAULT_CACERT: /certs/ca.crt
+      VAULT_CLIENT_CERT: /certs/mcp-gateway/tls.crt
+      VAULT_CLIENT_KEY: /certs/mcp-gateway/tls.key
+    volumes:
+      - ./deploy/mcp/registry.json:/mcp/registry.json:ro,z
+      - ./deploy/certs/mcp-gateway:/certs/mcp-gateway:ro,z
+      - ./deploy/certs/ca.crt:/certs/ca.crt:ro,z
+    depends_on:
+      vault:
+        condition: service_healthy
+      vault-mtls:
+        condition: service_started
+      envoy-egress:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - auth
+
+  watch:
+    build: .
+    command: ["watch", "--poll", "1s", "--log-format", "text"]
+    environment:
+      SYMAGIOS_DB_PATH: /data/symagios.db
+      SYMAGIOS_LOG_LEVEL: info
+      SYMAGIOS_LOG_FORMAT: text
+      SYMAGIOS_WATCH_MAX_PREVIEW: ${SYMAGIOS_WATCH_MAX_PREVIEW:-800}
+      # Observe-only by default. Answering HITL needs a TTY:
+      #   SYMAGIOS_WATCH_HITL=1 ./scripts/compose.sh --profile auth --profile watch run --rm --no-deps watch
+      SYMAGIOS_WATCH_HITL: ${SYMAGIOS_WATCH_HITL:-0}
+      VAULT_ADDR: https://vault.symagios.local:8202
+      VAULT_TOKEN: ${VAULT_TOKEN_ENGINE:?run_make_vault-install}
+      VAULT_CACERT: /certs/ca.crt
+      VAULT_CLIENT_CERT: /certs/engine/tls.crt
+      VAULT_CLIENT_KEY: /certs/engine/tls.key
+      SYMAGIOS_VAULT_ENGINE_PATH: symagios/engine
+    volumes:
+      - symagios-data:/data
+      - ./deploy/certs/engine:/certs/engine:ro,z
+      - ./deploy/certs/ca.crt:/certs/ca.crt:ro,z
+    depends_on:
+      vault:
+        condition: service_healthy
+      vault-mtls:
+        condition: service_started
+      engine:
+        condition: service_started
+    stdin_open: true
+    # tty:false — a detached PTY made watch think stdin was interactive and hang on HITL.
+    tty: false
+    profiles:
+      - watch
+
+volumes:
+  symagios-data:
+  keycloak-data:
+  keycloak-vault-secrets:

@@ -1,0 +1,36 @@
+# Symagios runtime config (non-secret). Mount or copy into the engine container.
+# API keys / tokens stay in env / Vault — do not put them here.
+
+# llm:
+#   # claude | claude-vertex | opencodex
+#   provider: claude
+#   model: claude-sonnet-4-20250514
+#   base_url: https://api.anthropic.com
+#   max_tokens: 4096
+#   vault_path: symagios/llm
+#   vault_field: api_key
+
+# Claude on Vertex AI (Google Cloud):
+llm:
+  provider: claude-vertex
+  # Vertex publisher ids use @version (not Anthropic API hyphen dates).
+  # Examples: claude-sonnet-4@20250514 | claude-3-5-haiku@20241022 | claude-3-5-sonnet-v2@20241022
+  model: claude-sonnet-4-5@20250929
+  # Leave project empty to take VERTEX_PROJECT / GOOGLE_CLOUD_PROJECT from the environment.
+  project: ""
+  location: global      # haiku is regional; global often 404 / different quota
+  max_tokens: 4096
+  vault_path: symagios/llm
+  vault_field: access_token        # optional short-lived bearer; prefer ADC / VERTEX_ACCESS_TOKEN
+
+# Auth: ADC (GOOGLE_APPLICATION_CREDENTIALS → refreshing) preferred over
+# VERTEX_ACCESS_TOKEN (~1h, frozen at container start). See HOW_TO_EXECUTE.md.
+
+# OpenCodex example:
+# llm:
+#   provider: opencodex
+#   model: gpt-5-codex
+#   base_url: https://api.openai.com/v1
+#   max_tokens: 4096
+#   vault_path: symagios/llm
+#   vault_field: api_key

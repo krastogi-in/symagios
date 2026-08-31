@@ -1,0 +1,55 @@
+{
+  "realm": "symagios",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "resetPasswordAllowed": true,
+  "bruteForceProtected": true,
+  "roles": {
+    "realm": [
+      { "name": "admin", "description": "Full Symagios admin" },
+      { "name": "operator", "description": "Operate agents and message/send" },
+      { "name": "agent-runner", "description": "Run agents and call MCP tools" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "symagios-gateway",
+      "name": "Symagios Agent Gateway",
+      "description": "OIDC client for the A2A agent gateway",
+      "enabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "redirectUris": [
+        "http://localhost:*/*"
+      ],
+      "webOrigins": [
+        "http://localhost:*"
+      ],
+      "publicClient": false,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": true,
+      "serviceAccountsEnabled": true,
+      "protocol": "openid-connect",
+      "fullScopeAllowed": true
+    },
+    {
+      "clientId": "symagios-cli",
+      "name": "Symagios CLI",
+      "description": "Public client for local CLI and tooling",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "http://localhost:*"
+      ],
+      "webOrigins": [
+        "*"
+      ],
+      "fullScopeAllowed": true
+    }
+  ],
+  "users": []
+}

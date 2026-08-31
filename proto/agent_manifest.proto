@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package symagios.proto.manifest;
+
+option go_package = "symagios/proto/manifest;manifest";
+
+enum ExecutionMode {
+  MODE_UNSPECIFIED = 0;
+  SERIAL           = 1; // Run targets sequentially
+  PARALLEL         = 2; // Run targets concurrently via WaitGroup
+}
+
+enum TargetType {
+  TYPE_UNSPECIFIED = 0;
+  SKILL            = 1;
+  AGENT            = 2;
+  SUB_AGENT        = 3;
+}
+
+message TargetDescriptor {
+  string name               = 1; // Unique capability identifier
+  TargetType type           = 2;
+  string description        = 3;
+  string data_source        = 4;
+  repeated string pre_checks    = 5;
+  repeated string post_checks   = 6;
+  int32 timeout_seconds     = 7;
+  string params_schema_json = 8;
+} 
+
+// Defines a single execution boundary in a workflow
+message PipelineStep {
+  string step_id           = 1; // e.g., "fetch_initial_telemetry"
+  ExecutionMode mode       = 2; // SERIAL or PARALLEL
+  repeated string targets  = 3; // References capability names registered under capabilities
+}
+
+message WorkflowPipeline {
+  string pipeline_id       = 1; // e.g., "incident_triage_flow"
+  repeated PipelineStep steps = 2; // Sequential list of execution boundaries
+}
+
+message AgentManifest {
+  string name                             = 1;
+  string version                          = 2;
+  string description                      = 3;
+  string data                             = 4;
+  repeated TargetDescriptor capabilities  = 5;
+  repeated WorkflowPipeline workflows     = 6; // Defined serial/parallel pipelines
+}

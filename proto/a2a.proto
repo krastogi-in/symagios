@@ -1,0 +1,215 @@
+// symagios/a2a.proto
+//
+// Working draft of an A2A-style schema for Symagios's agent-to-agent layer.
+// This is written from first principles based on the public A2A protocol's
+// documented concepts (AgentCard, Task, Message, Artifact, Part) -- it is
+// NOT a copy of the official a2a.proto. Cross-check field names/numbers
+// against https://a2a-protocol.org before relying on this for real
+// cross-framework interop; the goal here is to get you a correct mental
+// model and a working starting point, not a byte-for-byte spec clone.
+
+syntax = "proto3";
+
+package symagios.a2a.v1;
+
+option go_package = "symagios/proto/a2a;a2a";
+
+// ---------------------------------------------------------------------------
+// AGENT CARD -- the "identity document" an agent serves at
+// /.well-known/agent-card.json (or returns via GetAgentCard over gRPC).
+// A caller fetches this BEFORE ever sending a task, to learn who you are,
+// what you can do, and how to authenticate to you.
+// ---------------------------------------------------------------------------
+
+message AgentCard {
+  // Human-readable name of the agent. Not used for routing/matching --
+  // purely descriptive.
+  string name = 1;
+
+  // Short description of what this agent does, shown to humans or fed to
+  // an LLM deciding whether this agent is a good fit for a task.
+  string description = 2;
+
+  // Semantic version of THIS agent's implementation (not the A2A protocol
+  // version). Bump when your skills or behavior change meaningfully.
+  string version = 3;
+
+  // The endpoint other agents should call to actually talk to you.
+  // For a single-transport agent (recommended starting point) this is your
+  // one JSON-RPC URL. If you later support multiple transports, this is
+  // your PREFERRED one -- see additional_interfaces below.
+  string url = 4;
+
+  // Which wire format `url` above speaks. Keep this simple at first:
+  // "JSONRPC" is the safest default for broad interop across frameworks.
+  string preferred_transport = 5;
+
+  // Optional: other (url, transport) pairs if you expose more than one
+  // binding of the same agent (e.g. also a gRPC endpoint). Leave empty
+  // for your first working version -- add only when you have a concrete
+  // caller that needs a second transport.
+  repeated AgentInterface additional_interfaces = 6;
+
+  // Feature flags describing optional protocol behaviors this agent
+  // supports -- lets a caller know what it can rely on before it tries it.
+  AgentCapabilities capabilities = 7;
+
+  // Media types this agent accepts by default if a skill doesn't override
+  // them (e.g. "text/plain", "application/json").
+  repeated string default_input_modes = 8;
+  repeated string default_output_modes = 9;
+
+  // The list of discrete things this agent can do. A caller (human,
+  // orchestrator, or another agent's LLM) reads this to decide whether --
+  // and how -- to invoke you. Must have at least one entry.
+  repeated AgentSkill skills = 10;
+
+  // Declares how a caller must authenticate to `url`. This is what your
+  // Agent Gateway checks incoming requests against. Leaving this empty
+  // means "no authentication" -- fine for a toy example, never for
+  // anything real.
+  repeated SecurityScheme security_schemes = 11;
+}
+
+// One additional way to reach this same agent, beyond the primary `url`.
+message AgentInterface {
+  string url = 1;
+  string transport = 2; // e.g. "JSONRPC", "GRPC", "HTTP+JSON"
+}
+
+message AgentCapabilities {
+  // Whether this agent supports message/stream (incremental/SSE updates)
+  // in addition to plain request/response. Keep false until you actually
+  // implement streaming -- advertising a capability you don't support is
+  // worse than not advertising it.
+  bool streaming = 1;
+
+  // Whether this agent can push task updates to a caller-provided webhook
+  // instead of requiring the caller to poll GetTask.
+  bool push_notifications = 2;
+}
+
+// One discrete capability this agent offers. Think of this as the unit a
+// caller/registry searches on ("who can do skill X?").
+message AgentSkill {
+  // Stable identifier -- this is what your registry indexes on and what
+  // an OPA policy would reference ("Agent A may invoke skill X"). Do not
+  // rename this casually once other agents depend on it.
+  string id = 1;
+
+  string name = 2;
+  string description = 3;
+
+  // Free-form labels for discovery/search (e.g. ["travel", "flights"]).
+  repeated string tags = 4;
+
+  // Example prompts/utterances that would route to this skill -- useful
+  // if an LLM-based caller is deciding which skill to invoke.
+  repeated string examples = 5;
+
+  // Optional per-skill override of the agent's default input/output modes.
+  repeated string input_modes = 6;
+  repeated string output_modes = 7;
+}
+
+// Describes ONE way a caller can authenticate to this agent. An AgentCard
+// can list more than one (e.g. offer both API key and mTLS); the caller
+// picks whichever it can satisfy.
+message SecurityScheme {
+  // "apiKey" | "http" (bearer) | "oauth2" | "openIdConnect" | "mtls"
+  string type = 1;
+
+  // Where the credential goes for apiKey-style schemes: "header" | "query".
+  string in = 2;
+
+  // Name of the header/query param for apiKey-style schemes
+  // (e.g. "X-Agent-Key"), or the HTTP auth scheme name for "http" type
+  // (e.g. "Bearer").
+  string name = 3;
+}
+
+// ---------------------------------------------------------------------------
+// TASK -- the durable unit of work created by a message/send call.
+// This is the state machine your gateway and executor both care about.
+// ---------------------------------------------------------------------------
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_SUBMITTED = 1;      // created, not yet started
+  TASK_STATE_WORKING = 2;        // actively being processed
+  TASK_STATE_INPUT_REQUIRED = 3; // paused, waiting on more input from caller
+  TASK_STATE_COMPLETED = 4;      // terminal: success
+  TASK_STATE_FAILED = 5;         // terminal: error
+  TASK_STATE_CANCELED = 6;       // terminal: caller or agent aborted it
+}
+
+message Task {
+  // Unique ID for this unit of work. Caller uses this to poll GetTask or
+  // call CancelTask later.
+  string id = 1;
+
+  // Optional grouping ID if this task is part of a larger multi-task
+  // conversation/context -- lets you correlate related tasks in logs.
+  string context_id = 2;
+
+  TaskState status = 3;
+
+  // Human-readable reason, mainly populated on FAILED (why it failed) or
+  // INPUT_REQUIRED (what's needed to continue).
+  string status_message = 4;
+
+  // Final outputs, populated once status reaches COMPLETED. Empty
+  // otherwise.
+  repeated Artifact artifacts = 5;
+}
+
+// One output produced by a completed task -- a document, a structured
+// result, a file reference, etc. Composed of Parts so a single artifact
+// can mix e.g. text + a file.
+message Artifact {
+  string name = 1;
+  repeated Part parts = 2;
+}
+
+// The atomic unit of content inside a Message or Artifact. Exactly one of
+// these fields should be set -- proto3 doesn't enforce "exactly one" the
+// way a real oneof does unless you declare it as a oneof (done below).
+message Part {
+  oneof content {
+    string text = 1;
+    bytes file_bytes = 2;
+    string file_uri = 3;
+    string structured_json = 4; // JSON-encoded structured data
+  }
+
+  // MIME type of whichever field above is set, e.g. "text/plain",
+  // "application/pdf".
+  string media_type = 5;
+}
+
+// ---------------------------------------------------------------------------
+// MESSAGE -- what a caller sends to kick off (or continue) a task.
+// ---------------------------------------------------------------------------
+
+message Message {
+  // Unique ID for this message.
+  string id = 1;
+
+  // Context ID is used to group messages into a conversation.
+  string context_id = 2;
+
+  // "user" (from the calling agent) or "agent" (from you, e.g. when asking
+  // for more input on an INPUT_REQUIRED task).
+  string role = 3;
+
+  repeated Part parts = 4;
+
+  // If continuing an existing task (e.g. supplying requested input),
+  // reference it here. Leave empty when starting a new task.
+  string task_id = 5;
+
+  // Metadata is used to store any additional information about the message.
+  map<string, string> metadata = 6;
+
+}
+ 

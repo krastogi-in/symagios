@@ -1,0 +1,15 @@
+{
+  "comment": "Merge or attach these tools into deploy/mcp/registry.json for this use case",
+  "servers": [
+    {
+      "id": "ir-docs",
+      "enabled": true,
+      "transport": "stub",
+      "base_url": "stub://ir-docs",
+      "tools": [
+        { "name": "lookup_docs", "description": "IR runbook lookup" },
+        { "name": "echo", "description": "debug echo" }
+      ]
+    }
+  ]
+}

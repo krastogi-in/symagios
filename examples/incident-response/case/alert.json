@@ -1,0 +1,13 @@
+{
+  "case_id": "IR-2026-0918",
+  "severity": "high",
+  "source": "edr",
+  "summary": "Suspicious PowerShell download cradle on workstation ws-1042",
+  "host": "ws-1042.corp.example",
+  "user": "jdoe",
+  "indicators": [
+    "hxxp://203[.]0[.]113[.]50/payload.ps1",
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ],
+  "notes": "Replace with real alert JSON from your SIEM. Do not paste production secrets here."
+}

@@ -1,0 +1,7 @@
+bin/
+*.db
+*.db-*
+.DS_Store
+.env
+.env.vault-workloads
+deploy/secrets/

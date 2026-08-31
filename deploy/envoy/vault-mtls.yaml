@@ -1,0 +1,65 @@
+# mTLS front for Vault. Vault itself stays on 127.0.0.1:8200 (plaintext, same container).
+# Other containers, including the Keycloak secret fetch, must use https://vault:8202
+# and present a Vault-PKI client certificate.
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9903
+
+static_resources:
+  listeners:
+    - name: vault_mtls
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8202
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /certs/vault/tls.crt
+                    private_key:
+                      filename: /certs/vault/tls.key
+                validation_context:
+                  trusted_ca:
+                    filename: /certs/ca.crt
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: vault_mtls
+                route_config:
+                  name: vault
+                  virtual_hosts:
+                    - name: vault
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: vault_local
+                            timeout: 10s
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: vault_local
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: vault_local
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 8200
