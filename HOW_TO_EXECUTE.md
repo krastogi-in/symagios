@@ -28,11 +28,26 @@ cd /path/to/symagios
 ./scripts/stack-stop.sh                    # stop containers, keep volumes
 ./scripts/stack-delete.sh                  # stop + wipe SQLite (symagios-data)
 ./scripts/stack-delete.sh --all --yes      # also wipe Keycloak volumes
-./scripts/stack-start.sh --auth-force      # after --all, re-seed Vault/Keycloak
+./scripts/stack-start.sh --auth-force      # re-seed Vault/Keycloak (see below)
 ```
 
 Make aliases: `make stack-start`, `make stack-stop`, `make stack-delete`
 (`STACK_START_FLAGS=--watch`, `STACK_DELETE_FLAGS=--all --yes`).
+
+`stack-start` skips `auth-install` when Vault answers health checks. That is wrong after a
+**Vault process restart**: Vault runs in-memory (dev), so a new root token is minted and
+KV / workload tokens in `.env` (`VAULT_TOKEN`, `VAULT_TOKEN_KEYCLOAK`, …) are stale.
+Symptom: `keycloak-vault-fetch` exits 1 with `403` / `invalid token` / `permission denied`,
+and Keycloak never starts. Fix with `--auth-force` (also after `stack-delete --all`):
+
+```bash
+./scripts/stack-start.sh --auth-force [--build] [--watch]
+# or Vault-only: make vault-install
+# then: ./scripts/compose.sh --profile auth up -d --force-recreate keycloak-vault-fetch keycloak
+```
+
+Keycloak HTTP `:8080` is **not** published; install waits via `compose exec` inside the
+container. Tokens from the laptop always go through Envoy `https://localhost:8443`.
 
 Manual equivalent:
 
@@ -244,12 +259,14 @@ On startup the engine should log `worker cgroup attached` (four times). That nee
 Default guards **redact** and continue. For HITL from guards, use **block** mode and
 upload `guard-hitl` (does not replace the IR orchestrator path).
 
+Mode is read at engine start (`SYMAGIOS_CONTENT_MODE`). Changing it needs an engine
+recreate for now. A later config-manager (notify/diff, not a poller) can make this live.
+
 ```bash
-# 0) Engine in block mode (recreates engine once — export Vertex token if you use it)
+# 0) Engine in block mode (recreates engine once)
 source .env
 export SYMAGIOS_CONTENT_MODE=block
-export VERTEX_ACCESS_TOKEN="$(gcloud auth print-access-token)"   # if needed
-./scripts/compose.sh --profile auth up -d --force-recreate engine
+./scripts/compose.sh --profile auth up -d --force-recreate --no-deps engine
 
 # 1) HITL watcher (must not recreate engine)
 ./scripts/compose.sh --profile auth --profile watch up -d --no-recreate watch
@@ -296,7 +313,6 @@ Expect: engine log `pre-LLM content guard blocked payload`; status `WAITING_FOR_
 
 ```bash
 export SYMAGIOS_CONTENT_MODE=redact
-export VERTEX_ACCESS_TOKEN="$(gcloud auth print-access-token)"   # if needed
 ./scripts/compose.sh --profile auth up -d --no-deps --force-recreate engine
 ```
 

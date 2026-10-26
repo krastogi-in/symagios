@@ -76,3 +76,7 @@ SYMAGIOS_CONTENT_MODE=redact
 SYMAGIOS_CONTENT_MAX_RUNES=200000
 SYMAGIOS_CONTENT_BLOCKED_TERMS=internal-only,do-not-share
 ```
+
+Mode is applied at engine start. Recreate the engine container after changing
+`SYMAGIOS_CONTENT_MODE`. Live reload (config manager on notify/diff — not a poller)
+is deferred.
