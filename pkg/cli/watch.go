@@ -157,6 +157,19 @@ func promptHumanInput(
 		return fmt.Errorf("list waiting human-input runs: %w", err)
 	}
 
+	// Drop memory for actions that left WAITING so the same action can ask again
+	// (answer → Pending/Running → WAITING). Without this, seen/notified forever
+	// suppress the second prompt and operators think watch must be restarted.
+	waiting := make(map[string]struct{}, len(runs))
+	for _, run := range runs {
+		if sessionFilter != "" && run.SessionID != sessionFilter {
+			continue
+		}
+		waiting[actionKey(run)] = struct{}{}
+	}
+	pruneHitlMemory(seen, waiting)
+	pruneHitlMemory(notified, waiting)
+
 	for _, run := range runs {
 		if sessionFilter != "" && run.SessionID != sessionFilter {
 			continue
@@ -221,6 +234,14 @@ func promptHumanInput(
 
 func actionKey(run storage.ActionRun) string {
 	return fmt.Sprintf("%s\x00%s\x00%s", run.SessionID, run.ActionName, run.ActionType)
+}
+
+func pruneHitlMemory(mem, waiting map[string]struct{}) {
+	for k := range mem {
+		if _, ok := waiting[k]; !ok {
+			delete(mem, k)
+		}
+	}
 }
 
 func decryptField(encryptKey *encrypt.EncryptKey, raw string) string {
