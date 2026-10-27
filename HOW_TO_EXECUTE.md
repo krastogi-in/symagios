@@ -34,16 +34,18 @@ cd /path/to/symagios
 Make aliases: `make stack-start`, `make stack-stop`, `make stack-delete`
 (`STACK_START_FLAGS=--watch`, `STACK_DELETE_FLAGS=--all --yes`).
 
-`stack-start` skips `auth-install` when Vault answers health checks. That is wrong after a
-**Vault process restart**: Vault runs in-memory (dev), so a new root token is minted and
-KV / workload tokens in `.env` (`VAULT_TOKEN`, `VAULT_TOKEN_KEYCLOAK`, …) are stale.
-Symptom: `keycloak-vault-fetch` exits 1 with `403` / `invalid token` / `permission denied`,
-and Keycloak never starts. Fix with `--auth-force` (also after `stack-delete --all`):
+`stack-start` skips `auth-install` only when Vault is healthy **and** KV still has
+Keycloak secrets (and `VAULT_TOKEN_KEYCLOAK` is not a placeholder). After a **Vault
+process restart**, Vault is still “healthy” but in-memory KV / workload tokens are
+gone — without that seed check, `keycloak-vault-fetch` would sit on `403` and Keycloak
+never starts. A normal `./scripts/stack-start.sh` now re-seeds automatically; use
+`--auth-force` after `stack-delete --all` or whenever you want a full re-install:
 
 ```bash
-./scripts/stack-start.sh --auth-force [--build] [--watch]
+./scripts/stack-start.sh [--build] [--watch]   # auto re-seed if Vault KV is empty/stale
+./scripts/stack-start.sh --auth-force […]     # always re-run auth-install
 # or Vault-only: make vault-install
-# then: ./scripts/compose.sh --profile auth up -d --force-recreate keycloak-vault-fetch keycloak
+# then: ./scripts/install-keycloak.sh          # fetch secrets (run --rm) + up + sync RBAC
 ```
 
 Keycloak HTTP `:8080` is **not** published; install waits via `compose exec` inside the

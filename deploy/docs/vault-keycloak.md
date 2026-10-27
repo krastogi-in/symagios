@@ -33,8 +33,8 @@ It also turns on the PKI mount used for workload certs and issues **scoped workl
 ## How Keycloak gets the gateway secret
 
 1. Vault must be healthy and seeded.
-2. `keycloak-vault-fetch` presents the Keycloak workload cert to Vault over mTLS, reads the secret, and writes it into a shared volume.
-3. The Keycloak container waits for those files, starts `start-dev` with realm import, then uses `kcadm` on local HTTP to set the `symagios-gateway` client secret to whatever Vault had.
+2. Install/`stack-start` runs `keycloak-vault-fetch` as **`compose run --rm`** (`auth-fetch` profile) — not `up`. That presents the Keycloak workload cert to Vault over mTLS, reads the secret, and writes it into a shared volume, then removes the container (no `Exited` one-shot left in `ps`).
+3. The Keycloak container waits for those files, starts `start-dev` with realm import, then uses `kcadm` on local HTTP to set the `symagios-gateway` client secret to whatever Vault had (writes `/tmp/symagios-kc-bootstrap.done` when done).
 4. Install/sync bootstraps the operator user and assigns realm roles used by OPA (`x-symagios-roles`).
 
 The realm JSON still describes the client as confidential, but it does **not** embed the secret value. After sync, Keycloak’s own DB holds the live secret — that is runtime state, not a second git copy.

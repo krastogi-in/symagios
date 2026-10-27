@@ -68,25 +68,57 @@ else
 fi
 export SYMAGIOS_CONTENT_MODE="${SYMAGIOS_CONTENT_MODE:-redact}"
 
-vault_ok() {
+vault_healthy() {
 	symagios_auth_compose exec -T vault \
 		wget -qO- http://127.0.0.1:8200/v1/sys/health >/dev/null 2>&1
 }
 
+# Dev Vault is in-memory: process restart keeps /sys/health green but wipes KV and
+# invalidates VAULT_TOKEN_* in .env. Health-only checks then leave keycloak-vault-fetch
+# retrying 403s for minutes. Require a seeded path + a real Keycloak workload token.
+vault_seeded() {
+	[[ -n "${VAULT_TOKEN:-}" ]] || return 1
+	[[ -n "${VAULT_TOKEN_KEYCLOAK:-}" && "${VAULT_TOKEN_KEYCLOAK}" != "pending" ]] || return 1
+	symagios_auth_compose exec -T \
+		-e VAULT_ADDR=http://127.0.0.1:8200 \
+		-e VAULT_TOKEN="${VAULT_TOKEN}" \
+		vault vault kv get -field=password secret/symagios/keycloak/admin >/dev/null 2>&1
+}
+
+reload_env() {
+	# install-vault rewrites .env; shell exports from the initial source would otherwise
+	# win over the file and feed stale VAULT_TOKEN_* into compose interpolation.
+	# shellcheck disable=SC1091
+	source ./scripts/lib/load-env.sh
+}
+
+NEED_AUTH=0
 if [[ "$SKIP_AUTH" -eq 0 ]]; then
-	if [[ "$AUTH_FORCE" -eq 1 ]] || ! vault_ok; then
+	if [[ "$AUTH_FORCE" -eq 1 ]]; then
+		NEED_AUTH=1
+	elif ! vault_healthy; then
+		log "Vault not healthy — will run auth-install"
+		NEED_AUTH=1
+	elif ! vault_seeded; then
+		log "Vault healthy but KV/tokens missing or stale — will re-seed (dev Vault lost state)"
+		NEED_AUTH=1
+	else
+		log "Vault seeded — skipping auth-install (use --auth-force to re-seed)"
+	fi
+
+	if [[ "$NEED_AUTH" -eq 1 ]]; then
 		log "running auth-install (Vault / certs / Keycloak / OPA / Envoy)"
 		./scripts/install-auth.sh || {
 			log "auth-install reported an error — checking whether services recovered…"
-			# Keycloak/Envoy waits are flaky on cold start; continue if Vault is up.
-			vault_ok || {
-				echo "Vault is not healthy after auth-install; aborting." >&2
+			reload_env
+			vault_seeded || {
+				echo "Vault is not seeded after auth-install; aborting." >&2
+				echo "Try: ./scripts/stack-start.sh --auth-force" >&2
 				exit 1
 			}
-			log "Vault healthy; continuing (re-run install-keycloak/envoy if edge auth fails)"
+			log "Vault seeded; continuing (re-run install-keycloak/envoy if edge auth fails)"
 		}
-	else
-		log "Vault already healthy — skipping auth-install (use --auth-force to re-seed)"
+		reload_env
 	fi
 else
 	log "skipping auth-install (--skip-auth)"
@@ -99,6 +131,16 @@ fi
 
 log "starting auth-profile services"
 symagios_compose "${UP_ARGS[@]}"
+# After re-seed: refresh the secrets volume via run --rm (never `up` the one-shot —
+# that left Exited(1) and blocked Keycloak on service_completed_successfully), ensure
+# Keycloak is up, then sync RBAC. No force-recreate unless Keycloak is missing.
+if [[ "$NEED_AUTH" -eq 1 ]]; then
+	log "refreshing Keycloak secrets volume from Vault"
+	symagios_keycloak_vault_fetch
+	symagios_compose --profile auth up -d --no-deps keycloak
+	log "bootstrapping Keycloak client secret + RBAC users from Vault"
+	./scripts/install-keycloak.sh --sync-only
+fi
 
 if [[ "$WITH_WATCH" -eq 1 ]]; then
 	log "starting watch profile (--no-recreate so engine stays put)"

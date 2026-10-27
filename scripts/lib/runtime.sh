@@ -101,6 +101,16 @@ symagios_compose() {
 	"${COMPOSE[@]}" "$@"
 }
 
+# Refresh Keycloak secrets volume via one-shot `run --rm` (auth-fetch profile).
+# Never `up` this service — that left Exited containers and blocked Keycloak on
+# service_completed_successfully.
+symagios_keycloak_vault_fetch() {
+	symagios_require_compose
+	# Drop any leftover one-shot from older compose files (auth profile).
+	"${COMPOSE[@]}" --profile auth --profile auth-fetch rm -f keycloak-vault-fetch >/dev/null 2>&1 || true
+	"${COMPOSE[@]}" --profile auth --profile auth-fetch run --rm --no-deps keycloak-vault-fetch
+}
+
 symagios_build() {
 	symagios_runtime_init || exit 1
 	"${SYMAGIOS_CONTAINER_BIN}" build "$@"

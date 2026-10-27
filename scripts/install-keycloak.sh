@@ -12,7 +12,30 @@ source ./scripts/lib/load-env.sh
 TOKEN_URL="${TOKEN_URL:-https://localhost:8443}"
 KEYCLOAK_ADMIN="${KEYCLOAK_ADMIN:-admin}"
 KEYCLOAK_REALM="${KEYCLOAK_REALM:-symagios}"
-WAIT_TIMEOUT="${WAIT_TIMEOUT:-180}"
+# JVM cold start is usually <15s; 90s covers slow laptops without masking a bad probe.
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-90}"
+SYNC_ONLY=0
+
+usage() {
+	cat <<'EOF'
+Usage: ./scripts/install-keycloak.sh [--sync-only]
+
+  --sync-only   assume Keycloak is already up (or recreating); only wait + sync
+EOF
+	exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--sync-only) SYNC_ONLY=1 ;;
+	-h | --help) usage 0 ;;
+	*)
+		echo "unknown flag: $1" >&2
+		usage 1
+		;;
+	esac
+	shift
+done
 
 log() {
 	echo "[install-keycloak] $*"
@@ -25,17 +48,34 @@ require_command() {
 	fi
 }
 
+# Keycloak 26 serves /health/* on management :9000 (HTTPS), NOT on app :8080.
+# HTTP can be up before the entrypoint finishes kcadm bootstrap — wait for both.
+keycloak_http_ready() {
+	symagios_auth_compose exec -T keycloak \
+		sh -c "exec 3<>/dev/tcp/127.0.0.1/8080; echo -e 'GET /realms/master HTTP/1.1\r\nhost: localhost\r\nConnection: close\r\n\r\n' >&3; grep -q '200 OK' <&3" \
+		>/dev/null 2>&1
+}
+
+keycloak_bootstrap_done() {
+	symagios_auth_compose exec -T keycloak \
+		test -f /tmp/symagios-kc-bootstrap.done >/dev/null 2>&1
+}
+
 wait_for_keycloak() {
 	local deadline=$((SECONDS + WAIT_TIMEOUT))
+	local waited=0
 	while (( SECONDS < deadline )); do
-		if symagios_auth_compose exec -T keycloak \
-			sh -c "exec 3<>/dev/tcp/127.0.0.1/8080; echo -e 'GET /health/ready HTTP/1.1\r\nhost: localhost\r\nConnection: close\r\n\r\n' >&3; grep -q '200 OK' <&3" \
-			>/dev/null 2>&1; then
+		if keycloak_http_ready && keycloak_bootstrap_done; then
+			[[ "$waited" -gt 0 ]] && log "keycloak ready after ${waited}s"
 			return 0
 		fi
 		sleep 2
+		waited=$((waited + 2))
 	done
 	echo "keycloak did not become ready within ${WAIT_TIMEOUT}s" >&2
+	echo "hint: need GET /realms/master on :8080 AND /tmp/symagios-kc-bootstrap.done" >&2
+	echo "      (entrypoint writes the marker after client-secret kcadm)." >&2
+	echo "      check: ./scripts/compose.sh --profile auth logs --tail 80 keycloak" >&2
 	return 1
 }
 
@@ -48,10 +88,16 @@ if [[ -z "${KEYCLOAK_ADMIN_PASSWORD:-}" ]]; then
 	exit 1
 fi
 
-log "starting keycloak sidecar"
-symagios_auth_compose up -d keycloak
+if [[ "$SYNC_ONLY" -eq 0 ]]; then
+	log "fetching Keycloak secrets from Vault into shared volume (run --rm)"
+	symagios_keycloak_vault_fetch
+	log "starting keycloak"
+	symagios_auth_compose up -d keycloak
+else
+	log "sync-only — not recreating keycloak container"
+fi
 
-log "waiting for keycloak (inside the container; port 8080 is not published)"
+log "waiting for keycloak (HTTP :8080 + entrypoint bootstrap; :8080 is not published)"
 wait_for_keycloak
 
 log "syncing client secret + bootstrap operator user from Vault"

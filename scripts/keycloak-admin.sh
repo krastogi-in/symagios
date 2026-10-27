@@ -12,7 +12,9 @@ KEYCLOAK_URL="${KEYCLOAK_URL:-https://localhost:8443}"
 KEYCLOAK_ADMIN="${KEYCLOAK_ADMIN:-admin}"
 KEYCLOAK_REALM="${KEYCLOAK_REALM:-symagios}"
 KEYCLOAK_CLI_CLIENT="${KEYCLOAK_CLI_CLIENT:-symagios-cli}"
-KC_CONFIG="${KC_CONFIG:-/tmp/symagios-kcadm.config}"
+# Must differ from the entrypoint's /tmp/symagios-entrypoint-kcadm.config or concurrent
+# kcadm calls fight over the file lock ("Failed to get lock on …/kcadm.config").
+KC_CONFIG="${KC_CONFIG:-/tmp/symagios-admin-kcadm.config}"
 
 if [[ -z "${KEYCLOAK_ADMIN_PASSWORD:-}" ]]; then
 	echo "KEYCLOAK_ADMIN_PASSWORD unset — run ./scripts/generate-dev-secrets.sh" >&2
@@ -91,19 +93,38 @@ ensure_keycloak_running() {
 
 kcadm() {
 	ensure_keycloak_running
-	# Keycloak 26 rejects `kcadm.sh --config … <verb>`; credentials use the default config path.
-	symagios_auth_compose exec -T keycloak \
-		/opt/keycloak/bin/kcadm.sh "$@"
+	# Put --config after the verb (Keycloak 26 rejects `kcadm.sh --config … <verb>`).
+	symagios_auth_compose exec -T \
+		-e "KCADM_CONFIG=${KC_CONFIG}" \
+		keycloak \
+		/opt/keycloak/bin/kcadm.sh "$@" --config "${KC_CONFIG}"
 }
 
 kcadm_login() {
 	ensure_keycloak_running
-	symagios_auth_compose exec -T keycloak \
-		/opt/keycloak/bin/kcadm.sh config credentials \
-		--server "http://localhost:8080" \
-		--realm master \
-		--user "${KEYCLOAK_ADMIN}" \
-		--password "${KEYCLOAK_ADMIN_PASSWORD}" >/dev/null
+	local err
+	# Use 127.0.0.1 — Keycloak binds IPv4 only; `localhost` → ::1 often fails in-container.
+	# Password via env (not argv) so compose failure lines do not print the secret.
+	# Separate --config path avoids lock fights with the entrypoint's kcadm.
+	err="$(
+		symagios_auth_compose exec -T \
+			-e "KCADM_USER=${KEYCLOAK_ADMIN}" \
+			-e "KCADM_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD}" \
+			-e "KCADM_CONFIG=${KC_CONFIG}" \
+			keycloak \
+			sh -c '/opt/keycloak/bin/kcadm.sh config credentials \
+				--server http://127.0.0.1:8080 \
+				--realm master \
+				--user "$KCADM_USER" \
+				--password "$KCADM_PASSWORD" \
+				--config "$KCADM_CONFIG"' 2>&1
+	)" || {
+		log "kcadm login failed (admin=${KEYCLOAK_ADMIN} @ http://127.0.0.1:8080/master)"
+		[[ -n "${err}" ]] && printf '%s\n' "${err}" >&2
+		log "if Invalid credentials: admin password in Keycloak DB drifted from .env — wipe and re-bootstrap:"
+		log "  ./scripts/stack-delete.sh --all --yes && ./scripts/stack-start.sh --auth-force"
+		die "kcadm config credentials failed"
+	}
 }
 
 with_admin() {

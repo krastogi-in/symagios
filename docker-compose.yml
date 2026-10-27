@@ -42,6 +42,10 @@ services:
     profiles:
       - auth
 
+  # One-shot only: run via `compose --profile auth-fetch run --rm` (see install-keycloak /
+  # stack-start). NOT in the `auth` profile — a compose `up` one-shot with
+  # service_completed_successfully left Exited(1) containers that blocked Keycloak
+  # forever and cluttered `ps`. Keycloak waits on secret files in the shared volume.
   keycloak-vault-fetch:
     image: hashicorp/vault:1.17
     environment:
@@ -63,7 +67,7 @@ services:
     entrypoint: ["/bin/sh", "/opt/symagios/keycloak-vault-fetch.sh"]
     restart: "no"
     profiles:
-      - auth
+      - auth-fetch
 
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
@@ -94,11 +98,13 @@ services:
     depends_on:
       vault:
         condition: service_healthy
-      keycloak-vault-fetch:
-        condition: service_completed_successfully
+      vault-mtls:
+        condition: service_started
     # No host port for 8080. Plaintext Keycloak is not reachable from the laptop.
     # Keycloak 26 serves /health/* on the management port (:9000, HTTPS), not :8080.
     # Use a stable HTTP path on the app listener for compose readiness.
+    # Bootstrap (client secret via kcadm) finishes after HTTP is up — install scripts
+    # also wait for /tmp/symagios-kc-bootstrap.done inside the container.
     healthcheck:
       test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080; echo -e 'GET /realms/master HTTP/1.1\\r\\nhost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; grep -q '200 OK' <&3"]
       interval: 10s

@@ -5,9 +5,17 @@
 set -euo pipefail
 
 SECRET_DIR="${SECRET_DIR:-/run/secrets/vault}"
+# Dedicated kcadm config — never share the default ~/.keycloak/kcadm.config with
+# host-side keycloak-admin.sh execs (that race caused "Failed to get lock").
+KCADM_CONFIG="${KCADM_CONFIG:-/tmp/symagios-entrypoint-kcadm.config}"
+READY_MARKER="${READY_MARKER:-/tmp/symagios-kc-bootstrap.done}"
 
 log() {
 	echo "[keycloak-vault] $*"
+}
+
+kcadm() {
+	/opt/keycloak/bin/kcadm.sh "$@" --config "${KCADM_CONFIG}"
 }
 
 wait_for_file() {
@@ -26,7 +34,8 @@ wait_for_file() {
 wait_for_local() {
 	local i
 	for i in $(seq 1 90); do
-		if exec 3<>/dev/tcp/127.0.0.1/8080; then
+		# Suppress bash /dev/tcp "Connection refused" spam during JVM boot (~5–15s).
+		if exec 3<>/dev/tcp/127.0.0.1/8080 2>/dev/null; then
 			exec 3<&- || true
 			return 0
 		fi
@@ -34,6 +43,8 @@ wait_for_local() {
 	done
 	return 1
 }
+
+rm -f "${READY_MARKER}" "${KCADM_CONFIG}"
 
 wait_for_file "${SECRET_DIR}/client_secret"
 wait_for_file "${SECRET_DIR}/admin_password"
@@ -53,13 +64,13 @@ if ! wait_for_local; then
 fi
 
 log "setting symagios-gateway client secret from Vault"
-/opt/keycloak/bin/kcadm.sh config credentials \
+kcadm config credentials \
 	--server http://127.0.0.1:8080 \
 	--realm master \
 	--user "${KEYCLOAK_ADMIN:-admin}" \
 	--password "${KEYCLOAK_ADMIN_PASSWORD}" >/dev/null
 
-client_uuid=$(/opt/keycloak/bin/kcadm.sh get clients -r symagios -q clientId=symagios-gateway --fields id \
+client_uuid=$(kcadm get clients -r symagios -q clientId=symagios-gateway --fields id \
 	| sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' | head -n 1)
 
 if [[ -z "${client_uuid}" ]]; then
@@ -68,7 +79,9 @@ if [[ -z "${client_uuid}" ]]; then
 	exit 1
 fi
 
-/opt/keycloak/bin/kcadm.sh update "clients/${client_uuid}" -r symagios -s "secret=${client_secret}" >/dev/null
+kcadm update "clients/${client_uuid}" -r symagios -s "secret=${client_secret}" >/dev/null
 log "client secret applied"
+# Signal install-keycloak / sync that kcadm bootstrap is done (HTTP is up earlier).
+: >"${READY_MARKER}"
 
 wait "$kc_pid"
